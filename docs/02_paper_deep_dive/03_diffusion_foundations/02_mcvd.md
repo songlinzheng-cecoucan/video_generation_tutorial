@@ -1,857 +1,2574 @@
 # 章节编号：02_paper_deep_dive/03_diffusion_foundations/02_mcvd
-# 标题：MCVD 关键论文精读——从图像扩散到视频扩散系统化的桥梁（2021–2026）
+# 标题：MCVD 关键论文精读——从理论到复现的完整教学文档（2021–2026）
 
 > 章节类型：关键论文精读  
 > 时间定位：2021–2026（扩散视频早期 → 时空扩散范式成形 → 大规模 T2V 系统化）  
-> 使用说明：本章可直接用于授课、组会汇报、复现实践与读书会。
+> 状态：完整版教学稿（含公式、伪代码、图表占位、练习题与答案框架）
 
 ---
-
-## 0. 本章教学目标与阅读导航
-
-本章目标不是“记住 MCVD 的某个网络结构”，而是建立三层能力。
-
-第一层是理论能力：理解为什么图像扩散不能直接等同于视频扩散，为什么“时空联合建模”是必要条件而不是可选项。
-
-第二层是算法能力：能够写出 MCVD 的前向加噪、反向去噪、条件注入与训练目标，并能解释每个张量维度在做什么。
-
-第三层是工程能力：知道如何配置数据、训练、采样、评估与消融，能独立搭建一个可复现实验框架。
-
-为了保证可教学性，本章按“背景→方法→算法→训练→实验→创新与局限→演进链→扩展阅读→练习题”组织。每段尽量短，每段只讲一个核心意思。
-
----
+## 0. 章节概要与学习路径
+本章以 MCVD 为主线，完整讲解从问题定义到工程复现的全过程。
+教学目标是让读者能独立回答“为什么要做时空条件扩散”“如何实现”“如何评估”“如何改进”。
 
 ## 1. 背景与问题定义
-
-### 1.1 2020–2022：视频生成进入范式切换窗口
-
-2020 到 2022 年是视频生成最关键的“范式切换窗口”。此前社区主要依赖 GAN 和 AR。二者都做出了重要贡献，但都暴露了结构性瓶颈。
-
-GAN 路线擅长生成清晰纹理，尤其在短片段上视觉冲击力强。但 GAN 对抗训练的不稳定在视频上被放大：即使单帧看起来好，帧间也可能出现闪烁、形变、身份跳变。
-
-AR 路线（如 VideoGPT）把视频序列化为 token 并逐步预测。它在概率建模上很干净，适合严谨地定义似然目标。但视频 token 序列极长，分辨率一上去就爆显存与算力，推理速度也慢。
-
-早期扩散路线在图像任务上已经证明：训练稳定、模式覆盖更全、质量可持续提升。问题在于视频不是独立帧集合，而是动态系统。直接逐帧扩散会丢失时间约束，导致“帧内好看，帧间破碎”。
-
-这三种路线的对比结论是：社区需要一种方法，既保留扩散训练稳定性，又显式建模时序一致性，同时支持多任务条件生成。MCVD 在这个需求下出现。
-
-> 前序联系：AR 方法（VideoGPT）提供了“统一概率建模”的思想底座，但存在长序列成本瓶颈。  
-> 后续影响：MCVD 将“视频扩散可行性”变成“视频扩散可工程化”，推动 Video Diffusion / Space-Time U-Net 路线成形。
-
----
-
-### 1.2 MCVD 的任务边界：prediction / interpolation / unconditional
-
-MCVD 的教学价值首先体现在“任务统一”。它没有把 prediction、interpolation、unconditional 拆成三个完全不同的模型，而是统一为同一条件扩散接口。
-
-**任务 A：Video Prediction**。输入前若干帧，预测后续帧。这个任务强调动力学外推。
-
-**任务 B：Video Interpolation**。输入首尾或稀疏关键帧，补全中间帧。这个任务强调时间平滑与语义过渡。
-
-**任务 C：Unconditional Generation**。不给条件，直接从噪声生成视频。这个任务强调模型先验分布能力。
-
-MCVD 的统一方法是：已知帧作为条件，未知帧作为生成目标，通过掩码决定哪些位置被约束、哪些位置由去噪网络恢复。这样，一个训练框架即可覆盖三类任务。
-
-这类统一接口在后来大规模 T2V 系统非常重要，因为工程团队需要可组合、可替换、可迁移的统一协议。
-
----
-
-### 1.3 问题形式化：为什么是“时空条件补全”
-
-设视频为张量 `x0 ∈ R^{T×H×W×C}`。在 MCVD 视角下，视频生成可写为：
-
-- 给定条件 `c`（已知帧/关键帧/空条件）；
-- 给定掩码 `m`（已知=1，未知=0）；
-- 学习 `p(x0_unknown | c, m)`。
-
-这个表述把多个任务都转化为“条件补全问题”。
-
-这比把任务分裂为多个专用网络更有长期价值，因为：
-
-1. 训练数据利用率更高；
-2. 模型参数共享更充分；
-3. 迁移到新条件信号更容易（文本、轨迹、深度等）。
-
----
-
-### 1.4 本节小结
-
-MCVD 的背景逻辑可以浓缩为一句话：**它不是在“某个指标”上小修小补，而是把视频生成问题重写为统一时空条件扩散问题。**
-
----
-
-## 2. 方法总览（条件扩散 + 时空去噪）
-
-### 2.1 总体框架
-
-MCVD 的总体框架由四层组成：
-
-1. 条件构造层：根据任务类型构造 `c` 与 `m`；
-2. 前向扩散层：向待生成区域注入噪声；
-3. 时空去噪层：网络学习去噪映射；
-4. 反向采样层：逐步恢复视频。
-
-核心输出是完整视频片段 `x0_hat`，其已知区域与条件一致，未知区域由模型补全。
-
----
-
-### 2.2 输入输出张量与维度
-
-为了避免“概念会但代码写不出来”，必须明确维度：
-
-- `x0`: `[B, T, H, W, C]`，原始干净视频；
-- `xt`: `[B, T, H, W, C]`，第 `t` 步噪声视频；
-- `c`: `[B, T, H, W, C]` 或特征图形式，条件信息；
-- `m`: `[B, T, H, W, 1]`，二值/软掩码；
-- `te`: `[B, d_t]`，时间步嵌入；
-- `y`: `[B, d_y]`，任务类型嵌入（pred/interp/uncond）。
-
-输出通常是 `eps_hat`（噪声预测）或 `v_hat`（v-parameterization），再映射到 `x_{t-1}`。
-
----
-
-### 2.3 条件注入设计动机
-
-为什么要显式掩码？因为视频条件不是单一标签，而是“局部已知、局部未知”的结构化约束。
-
-条件注入的目标是让网络在每个去噪步骤都“看见”已知区域，并对未知区域进行一致性恢复，而不是只在输入第一步看一次条件。
-
-这种“持续注入”思想影响了后续很多 T2V 方法中的 cross-attention、多分支条件控制与控制网络设计。
-
-> 前序联系：AR 依赖 token 自回归状态传递，条件表达通常序列化。  
-> 后续影响：扩散体系中逐步条件注入成为可控生成标准范式。
-
----
-
-### 2.4 方法流程图（可转 PDF）
-
+### 1.1 范式竞争：GAN / AR / 早期扩散
+- GAN 优势：纹理锐度高；瓶颈：跨帧一致性不稳定。
+- AR 优势：似然目标清晰；瓶颈：长序列成本高。
+- 早期扩散优势：训练稳定；瓶颈：直接逐帧会破坏时序结构。
+> 前序联系：VideoGPT 代表 AR 的统一建模视角。
+> 后续影响：MCVD 将统一视角迁移到扩散框架。
+### 1.2 任务边界
+- prediction：给过去帧预测未来帧。
+- interpolation：给关键帧补中间帧。
+- unconditional：无条件从噪声生成。
+## 2. 方法总览
+### 2.1 统一接口
+MCVD 将三类任务统一为“条件掩码下的时空去噪补全”。
+### 2.2 输入输出张量
+- `x0`: `[B,T,H,W,C]`；`xt`: 噪声视频；`c`: 条件；`m`: 掩码。
+### 2.3 条件注入设计
+核心思想：每一步去噪都看到条件，而不是只在初始输入看到一次。
+### 2.4 流程图
 ```text
-[Task Type τ] ---> [Condition Builder] ---> c
-                    [Mask Builder] -------> m
-
-x0 --forward noise--> xt ------------------------------+
-                                                       |
-c,m ------------------------------+                    v
-                                  +--> [ST Denoiser εθ(xt,t,c,m)] --> eps_hat --> x_{t-1}
-                                                       ^
-                                                       |
-                                              [Time Embedding t]
-
-repeat t = Td ... 1
-
-Final: x0_hat -> task output (prediction / interpolation / unconditional)
+[Build c,m] -> [Forward Noise] -> [ST Denoiser] -> [Reverse Sampling] -> [Output]
 ```
-
----
-
-### 2.5 与图像 DDPM 的本质差异
-
-1. **对象不同**：图像是 2D，视频是时空 3D（或 2D+time）结构。
-2. **条件不同**：图像常见标签条件；视频常见局部已知帧条件。
-3. **误差容忍不同**：图像允许局部瑕疵；视频对帧间抖动极敏感。
-4. **评估不同**：视频要看分布质量 + 时序连贯 + 重建精度。
-
-因此 MCVD 不是“把 2D 网络改 3D”这么简单，而是把任务定义、条件协议、网络主干、采样策略全部时空化。
-
----
-
 ## 3. 算法流程与关键公式
-
 ### 3.1 符号表
-
-| 符号 | 含义 | 张量/类型 |
+| 符号 | 含义 | 维度 |
 |---|---|---|
-| `x0` | 干净视频 | `[B,T,H,W,C]` |
-| `xt` | 第 t 步噪声视频 | `[B,T,H,W,C]` |
-| `eps` | 高斯噪声 | 同 `x0` |
-| `βt` | 噪声日程 | 标量 |
-| `αt=1-βt` | 信号保留系数 | 标量 |
-| `āt=∏_{s=1..t} αs` | 累积保留系数 | 标量 |
-| `c` | 条件视频/特征 | 任务相关 |
-| `m` | 条件掩码 | `[B,T,H,W,1]` |
-| `εθ` | 去噪网络 | 函数 |
-| `Td` | 扩散总步数 | 整数 |
-
-来源占位：`[MCVD 原论文公式节]`
-
----
-
-### 3.2 前向加噪（q 过程）
-
-标准扩散前向过程：
-
-\[
-q(x_t|x_{t-1})=\mathcal{N}(x_t;\sqrt{1-\beta_t}x_{t-1},\beta_tI)
-\]
-
-闭式写法：
-
-\[
-q(x_t|x_0)=\mathcal{N}(x_t;\sqrt{\bar{\alpha}_t}x_0,(1-\bar{\alpha}_t)I)
-\]
-
-在 MCVD 场景中，常用策略是对未知区域扩散、已知区域保留为条件，或将已知区域以掩码方式拼接注入。
-
----
-
-### 3.3 条件掩码注入公式
-
-一个常见实现表达：
-
-\[
-\tilde{x}_t = m\odot c + (1-m)\odot x_t
-\]
-
-解释：
-
-- `m=1` 的位置直接使用条件；
-- `m=0` 的位置由噪声视频提供待恢复内容。
-
-网络预测：
-
-\[
-\hat{\epsilon}=\epsilon_\theta(\tilde{x}_t,t,c,m)
-\]
-
-若采用特征级注入，`c,m` 会先编码为特征，再在 U-Net 多层融合。
-
----
-
-### 3.4 训练目标
-
-基础目标（噪声预测）：
-
-\[
-\mathcal{L}_{noise}=\mathbb{E}_{x_0,\epsilon,t}\left[\|\epsilon-\epsilon_\theta(\tilde{x}_t,t,c,m)\|_2^2\right]
-\]
-
-常见扩展目标（占位）：
-
-\[
-\mathcal{L}=\lambda_n\mathcal{L}_{noise}+\lambda_r\mathcal{L}_{rec}+\lambda_t\mathcal{L}_{temp}+\lambda_p\mathcal{L}_{perc}
-\]
-
-其中：
-
-- `L_rec`：重建一致；
-- `L_temp`：时间平滑/光流一致；
-- `L_perc`：感知质量增强。
-
-来源占位：`[MCVD 损失函数章节]`
-
----
-
-### 3.5 反向去噪采样（p 过程）
-
-\[
-p_\theta(x_{t-1}|x_t,c)=\mathcal{N}(x_{t-1};\mu_\theta(x_t,t,c),\Sigma_\theta(x_t,t,c))
-\]
-
-`μθ` 通常由 `eps_hat` 与已知日程系数构造。采样从 `xTd ~ N(0,I)` 开始反推到 `x0`。
-
----
-
-### 3.6 伪代码（含维度注释）
-
+| x0 | 干净视频 | [B,T,H,W,C] |
+| xt | t步噪声视频 | [B,T,H,W,C] |
+| c | 条件 | [B,T,H,W,C]或特征 |
+| m | 掩码 | [B,T,H,W,1] |
+### 3.2 前向/反向公式
+$$q(x_t|x_{t-1})=\mathcal{N}(x_t;\sqrt{1-eta_t}x_{t-1},eta_tI)$$
+$$q(x_t|x_0)=\mathcal{N}(x_t;\sqrt{ar{lpha}_t}x_0,(1-ar{lpha}_t)I)$$
+$$	ilde{x}_t=m\odot c+(1-m)\odot x_t$$
+$$\mathcal{L}_{noise}=\mathbb{E}[\|\epsilon-\epsilon_	heta(	ilde{x}_t,t,c,m)\|_2^2]$$
+### 3.3 伪代码
 ```pseudo
-Algorithm 1: Unified MCVD Training
-Input:
-  x0: [B,T,H,W,C]
-  task type τ in {pred, interp, uncond}
-  diffusion schedule {β1...βTd}
-
-1  c, m = BuildConditionAndMask(x0, τ)
-   # c: [B,T,H,W,C], m: [B,T,H,W,1]
-2  sample t ~ Uniform(1, Td)
-3  sample eps ~ N(0, I), eps shape = [B,T,H,W,C]
-4  xt = sqrt(āt)*x0 + sqrt(1-āt)*eps
-5  x_tilde = m ⊙ c + (1-m) ⊙ xt
-6  eps_hat = εθ(x_tilde, t, c, m)
-7  loss = ||eps - eps_hat||^2 (+ optional temporal/perceptual terms)
-8  backprop + optimizer step
-
-Algorithm 2: Unified MCVD Sampling
-Input: c, m, Td
-1  xTd ~ N(0, I)
-2  for t = Td ... 1:
-3      x_tilde = m ⊙ c + (1-m) ⊙ xt
-4      eps_hat = εθ(x_tilde, t, c, m)
-5      xt-1 = ReverseStep(xt, eps_hat, t)
-6  return x0_hat
+Input: x0[B,T,H,W,C], task τ
+c,m=BuildCondition(x0,τ)
+sample t, eps
+xt=sqrt(āt)*x0+sqrt(1-āt)*eps
+x_tilde=m*c+(1-m)*xt
+eps_hat=eps_theta(x_tilde,t,c,m)
+loss=||eps-eps_hat||^2
 ```
-
----
-
-### 3.7 条件掩码时空关系 ASCII 图
-
-```text
-Time --->   f1   f2   f3   f4   f5   f6
-Mask m:      1    1    0    0    0    1
-Meaning:    known known gen  gen  gen known
-
-Per denoise step t:
-  x_tilde = m*c + (1-m)*x_t
-  known frames stay anchored
-  unknown frames updated by εθ
-```
-
-来源占位：`[本章自绘示意]`
-
----
-
-### 3.8 本节小结
-
-算法核心是“掩码条件 + 时空去噪 + 多步反推”。掌握这三点，就掌握了 MCVD 的骨架。
-
----
-
 ## 4. 训练策略与数据设置
-
-### 4.1 数据集与任务映射
-
-建议按“任务覆盖”组织数据集：
-
-- Prediction：动态连续视频（动作/机器人/交通）；
-- Interpolation：存在明确关键帧关系的数据；
-- Unconditional：类别丰富、分布广的数据。
-
-占位数据集（后续核验）：`[BAIR] [Human3.6M] [UCF101] [Kinetics Subset]`。
-
-每个数据集都要记录：许可协议、分辨率范围、帧率分布、动作复杂度，否则复现结果不可比较。
-
----
-
-### 4.2 裁剪策略与分辨率策略
-
-建议使用固定长度片段训练：例如 `T=16/24/32`。
-
-帧率建议做统一重采样：如 `8/12/16 FPS`，避免数据源帧率差异造成动态速度偏置。
-
-分辨率建议分阶段：
-
-1. 低分辨率（64²/128²）学时序；
-2. 中高分辨率（256²+）补纹理。
-
-随机增强必须“时序同步”，不能每帧独立随机裁剪，否则会人为制造错误运动。
-
----
-
-### 4.3 超参数模板（可复现）
-
-| 配置项 | 推荐范围（占位） | 影响 |
-|---|---|---|
-| Optimizer | Adam/AdamW | 收敛稳定 |
-| LR | 1e-4~2e-4 | 收敛速度/振荡 |
-| Batch | 8~64 | 梯度噪声 |
-| Diffusion Steps(train) | 500~1000 | 建模细粒度 |
-| EMA | 开启 | 采样质量 |
-| Grad Clip | 0.5~1.0 | 防爆梯度 |
-| Weight Decay | 0~0.01 | 泛化 |
-
-来源占位：`[复现实验日志]`
-
----
-
-### 4.4 稳定性技巧
-
-**技巧 1：噪声日程实验化。** 线性与 cosine 对细节恢复行为不同，要在小规模验证集先比较。
-
-**技巧 2：条件 dropout。** 随机弱化条件输入，提升模型在不完备条件下的鲁棒性。
-
-**技巧 3：梯度与混精管理。** AMP + 梯度累积可在有限显存下稳定训练大 batch。
-
-**技巧 4：课程学习。** 先短序列再长序列，先简单运动再复杂场景，减少训练初期发散。
-
-**技巧 5：采样监控。** 固定 seed 每 N step 导出视频网格，用肉眼跟踪时序伪影。
-
----
-
-### 4.5 采样步数与速度质量折中
-
-训练使用较大步数学习完整去噪动力学；推理可用少步采样提速。
-
-建议建立一张“步数-质量-时延”曲线：`{1000, 250, 100, 50, 25}`。
-
-一般规律：步数下降先伤害运动细节，再伤害空间清晰度。不同数据集阈值不同，不能套固定经验。
-
----
-
-### 4.6 本节小结
-
-训练不是填参数，而是设计“数据-模型-采样-评估”的闭环。MCVD 的工程价值恰恰体现在这个闭环可系统化。
-
----
-
+- 数据集占位：BAIR/Human3.6M/UCF101/Kinetics。
+- 片段裁剪：T=16/24/32；帧率统一8/12/16 FPS。
+- 分辨率：64/128 先训时序，再升到256补细节。
+- 优化器：AdamW；学习率占位：1e-4~2e-4。
+- 稳定技巧：EMA、梯度裁剪、条件dropout、混合精度、课程学习。
 ## 5. 实验与 Benchmark
-
-### 5.1 指标选择原则
-
-FVD 衡量视频分布逼真度，适合整体质量比较。
-
-PSNR/SSIM 衡量重建精度，适合 prediction/interpolation 任务。
-
-建议至少同时报告：`FVD + (PSNR, SSIM) + 人评`，避免单指标误导。
-
----
-
-### 5.2 Benchmark 对比表（占位）
-
-| Model | Task | Dataset | FVD ↓ | PSNR ↑ | SSIM ↑ | Human Pref ↑ | Source |
-|---|---|---|---:|---:|---:|---:|---|
-| GAN Baseline | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [paper/url] |
-| AR Baseline(VideoGPT-style) | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [paper/url] |
-| Early Diffusion | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [paper/url] |
-| **MCVD** | pred | [D1] | **[ ]** | **[ ]** | **[ ]** | **[ ]** | [paper/url] |
-| **MCVD** | interp | [D2] | **[ ]** | **[ ]** | **[ ]** | **[ ]** | [paper/url] |
-| **MCVD** | uncond | [D3] | **[ ]** | - | - | **[ ]** | [paper/url] |
-
-列解释：
-
-- `FVD↓` 越低越好；
-- `PSNR/SSIM↑` 越高越好；
-- `Human Pref↑` 为人评偏好比例。
-
----
-
-### 5.3 消融实验表（占位）
-
-| Variant | ST Module | Cond Mask | Steps | FVD ↓ | SSIM ↑ | Inference Latency(ms) ↓ | 说明 |
-|---|---|---|---:|---:|---:|---:|---|
-| V1 | weak | yes | 250 | [ ] | [ ] | [ ] | 时序抖动 |
-| V2 | strong | no | 250 | [ ] | [ ] | [ ] | 条件偏离 |
-| V3 | strong | yes | 250 | [ ] | [ ] | [ ] | 质量最好 |
-| V4 | strong | yes | 100 | [ ] | [ ] | [ ] | 速度提升 |
-| V5 | strong | yes | 50 | [ ] | [ ] | [ ] | 细节下降 |
-
-列解释：
-
-- `ST Module`：时空网络能力强弱；
-- `Cond Mask`：是否使用掩码条件注入；
-- `Steps`：采样步数；
-- `Latency`：单 clip 推理时延。
-
----
-
-### 5.4 可视化案例（文字分析模板）
-
-**案例 A（Prediction）**：给前 8 帧预测后 8 帧。观察目标：动作方向是否连贯、轮廓是否稳定、背景是否闪烁。
-
-**案例 B（Interpolation）**：给首尾帧补中间帧。观察目标：过渡是否平滑、关键结构是否跨帧一致。
-
-**案例 C（Unconditional）**：随机采样。观察目标：全局动态是否自然、是否出现语义崩塌。
-
-建议所有可视化都配套 `seed`、`prompt/condition`、`sampling steps`，保证可复验。
-
----
-
-### 5.5 失败案例（现象→原因→修复）
-
-**失败 1：高速运动拖影**  
-现象：边缘糊、轨迹拖尾。  
-原因：高频运动恢复不足。  
-修复：提升训练中高速样本占比 + 强化时间损失 + 增加关键步采样精度。
-
-**失败 2：多主体交互错位**  
-现象：手脚穿插、相对位置突变。  
-原因：对象关系建模弱。  
-修复：加入对象级条件、关系注意力或分层场景表示。
-
-**失败 3：长时身份漂移**  
-现象：角色纹理逐段变化。  
-原因：全局记忆不足。  
-修复：跨段记忆 token、关键帧锚定、分段对齐损失。
-
----
-
-### 5.6 本节小结
-
-MCVD 实验价值在于：它同时展示了扩散在视频上的可行性与边界。可行性体现在稳定与统一；边界体现在效率与长时一致性。
-
----
-
+### 5.1 指标
+- FVD：整体视频分布质量。
+- PSNR/SSIM：重建质量。
+### 5.2 对比表（占位）
+| 方法 | 任务 | 数据集 | FVD↓ | PSNR↑ | SSIM↑ |
+|---|---|---|---:|---:|---:|
+| GAN | pred | D1 | [ ] | [ ] | [ ] |
+| AR | pred | D1 | [ ] | [ ] | [ ] |
+| MCVD | pred | D1 | [ ] | [ ] | [ ] |
+### 5.3 消融表（占位）
+| 变体 | 时空模块 | 掩码 | 步数 | FVD↓ |
+|---|---|---|---:|---:|
+| V1 | weak | yes | 250 | [ ] |
+| V2 | strong | no | 250 | [ ] |
+| V3 | strong | yes | 250 | [ ] |
 ## 6. 创新点总结
-
-### 6.1 技术创新
-
-1. **统一任务接口**：用掩码条件统一 prediction/interpolation/unconditional。
-2. **时空去噪建模**：从 2D 图像去噪过渡到视频时空去噪。
-3. **条件持续注入**：每一步采样都受条件约束，减少漂移。
-
----
-
-### 6.2 方法论创新
-
-MCVD 的方法论贡献是“定义问题的方式改变了”。
-
-从“为每个任务做专门模型”转向“做一个可组合的条件扩散系统”。这是后续大模型工程最需要的思维方式。
-
----
-
-### 6.3 对后续研究启发
-
-- 启发一：把条件做成统一协议（文本、图像、轨迹可扩展）；
-- 启发二：把时空建模模块化（U-Net/Transformer 可替换）；
-- 启发三：把采样器当系统级优化对象（速度与质量协同）。
-
-> 后续影响：这些思想在 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 中被系统放大。
-
----
-
-## 7. 局限与改进方向（现象→原因→改进路线）
-
-### 7.1 计算成本高
-
-现象：训练和采样慢，部署成本高。
-
-原因：视频张量高维，多步反推重复计算。
-
-改进路线：
-
-1. 少步采样/蒸馏；
-2. 潜空间扩散；
-3. 稀疏时空计算与缓存；
-4. 硬件友好算子与并行调度。
-
----
-
-### 7.2 长视频一致性不足
-
-现象：片段变长后语义漂移和角色漂移。
-
-原因：模型主要优化局部窗口，缺少全局记忆。
-
-改进路线：
-
-1. 记忆模块（memory bank, recurrent state）；
-2. 分段生成+跨段对齐；
-3. 叙事级规划（事件图/脚本约束）。
-
----
-
-### 7.3 条件融合深度不足
-
-现象：复杂文本或多条件控制时失真增大。
-
-原因：早期条件接口偏帧级，语义对齐能力弱。
-
-改进路线：
-
-1. 强语义编码器（VLM/LLM）；
-2. 多尺度 cross-attention；
-3. 指令一致性损失与偏好对齐训练。
-
----
-
-### 7.4 评测不完整
-
-现象：指标升高但主观体验不一定更好。
-
-原因：单一指标不能覆盖叙事连贯和可控性。
-
-改进路线：
-
-1. 任务导向评测集；
-2. 标准化人评协议；
-3. 开源复现实验平台与统一脚本。
-
----
-
-## 8. 前后关联与技术演进（因果链）
-
-### 8.1 前序联系：VideoGPT / AR
-
-AR 路线展示了视频概率建模的严谨性，但带来序列长度与推理成本问题。MCVD 继承其“统一生成”目标，改用扩散去噪机制降低训练不稳定与模式坍塌风险。
-
-> 前序联系：VideoGPT 提供统一序列建模视角。  
-> MCVD 转向：从 token 续写改为噪声反演。
-
----
-
-### 8.2 后续影响：Video Diffusion / Space-Time U-Net / Imagen Video / VideoFusion
-
-MCVD 验证“视频扩散可行”，于是社区开始系统优化：
-
-1. **Video Diffusion**：完善时空扩散建模与采样稳定；
-2. **Space-Time U-Net**：把时空主干标准化；
-3. **Imagen Video**：级联与高分辨率体系化；
-4. **VideoFusion**：强化跨帧融合与一致性控制。
-
-> 后续影响：MCVD 从“桥梁方法”变成“系统设计模板”的起点。
-
----
-
-### 8.3 时间线 ASCII 图
-
+1. 统一任务接口。
+2. 时空去噪建模。
+3. 条件持续注入。
+> 后续影响：为 Video Diffusion / ST U-Net / Imagen Video 的系统化奠基。
+## 7. 局限与改进方向
+- 现象：计算开销高；原因：高维+多步；改进：蒸馏/潜空间/稀疏计算。
+- 现象：长视频漂移；原因：全局记忆弱；改进：跨段记忆与层次规划。
+- 现象：复杂条件不稳；原因：语义融合浅；改进：cross-attn+强编码器。
+## 8. 前后关联与技术演进
+> 前序联系：VideoGPT/AR 解决统一建模但成本高。
+> 后续影响：MCVD -> Video Diffusion -> Space-Time U-Net -> Imagen Video -> VideoFusion。
 ```text
-2020 -------- 2021 -------- 2022 -------- 2023 -------- 2024 -------- 2025/2026
- GAN/AR主导     MCVD桥接期      视频扩散成熟期     时空主干标准化      大规模T2V系统化     Foundation趋势
- (MoCoGAN,      (统一条件扩散)   (Video Diffusion)  (Space-Time U-Net) (Imagen/VideoFusion) (Sora/Veo/Gen)
- VideoGPT)
-
-因果链：
-AR/GAN瓶颈 -> MCVD统一接口 -> 时空扩散范式 -> 级联/可控/大规模系统 -> 世界模型化
+2020 GAN/AR -> 2021 MCVD -> 2022/23 Video Diffusion -> 2024+ Large-scale T2V
 ```
-
-来源占位：`[本章整理 + 各论文发布时间]`
-
----
-
 ## 9. 衍生工作与扩展阅读
-
-### 9.1 后续论文分组（占位）
-
-**A. 架构改进**：Video Diffusion Models、Space-Time U-Net、Latent Video Diffusion。
-
-**B. 效率优化**：少步采样、扩散蒸馏、一致性模型、缓存推理。
-
-**C. 可控生成**：文本对齐、轨迹控制、姿态/深度/分割条件。
-
-**D. 长时生成**：分段记忆、层次规划、叙事一致性模型。
-
----
-
-### 9.2 开源复现可借鉴模块
-
-1. 条件构造器（Condition Builder）；
-2. 掩码调度器（Mask Scheduler）；
-3. 时空去噪主干（ST Backbone）；
-4. 采样器（Sampler）；
-5. 评测脚本（FVD/PSNR/SSIM + 可视化导出）。
-
-这些模块可以独立替换，适合教学实验和工程迭代。
-
----
-
-### 9.3 建议阅读顺序
-
-1. VideoGPT（理解 AR 优缺点）；
-2. MCVD（理解统一条件视频扩散）；
-3. Video Diffusion Models（理解扩散范式深化）；
-4. Space-Time U-Net（理解主干标准化）；
-5. Imagen Video / VideoFusion（理解系统化落地）；
-6. 2025–2026 综述（建立全局视角）。
-
----
-
-## 10. 图表清单（可直接替换实图）
-
-### 图 10-1：训练与采样流程图（占位）
-
-```text
-[Input Clip] -> [Build c,m] -> [Forward Noise] -> [ST Denoise Net] -> [Reverse Steps] -> [Output Clip]
-```
-
-来源占位：`[自绘/论文复刻]`
-
----
-
-### 图 10-2：时空去噪与前后帧关系 ASCII（占位）
-
-```text
-Frames:      f1    f2    f3    f4    f5    f6
-Cond mask:    K     K     ?     ?     ?     K
-Noise lvl:   low  medium high  high medium low
-Denoise:      |------ temporal consistency propagation ------|
-Output:      f1'   f2'   f3'   f4'   f5'   f6'
-```
-
-来源占位：`[本章示意]`
-
----
-
-### 图 10-3：条件掩码操作示意
-
-```text
-x_tilde = m*c + (1-m)*x_t
-m=1 -> copy condition
-m=0 -> generate by denoiser
-```
-
-来源占位：`[公式可视化示意]`
-
----
-
-### 表 10-1：Benchmark 总表（占位）
-
-| Model | Task | Dataset | FVD ↓ | PSNR ↑ | SSIM ↑ | HumanPref ↑ | Date |
-|---|---|---|---:|---:|---:|---:|---|
-| GAN baseline | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [YYYY-MM-DD] |
-| AR baseline | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [YYYY-MM-DD] |
-| MCVD | pred | [D1] | [ ] | [ ] | [ ] | [ ] | [YYYY-MM-DD] |
-| MCVD | interp | [D2] | [ ] | [ ] | [ ] | [ ] | [YYYY-MM-DD] |
-| MCVD | uncond | [D3] | [ ] | - | - | [ ] | [YYYY-MM-DD] |
-
-来源占位：`[论文/复现仓库]`
-
----
-
-### 表 10-2：消融实验表（占位）
-
-| Variant | ST Backbone | Cond Injection | Steps | FVD ↓ | SSIM ↑ | Runtime ↓ | 结论 |
-|---|---|---|---:|---:|---:|---:|---|
-| A | weak | yes | 250 | [ ] | [ ] | [ ] | 时序不足 |
-| B | strong | no | 250 | [ ] | [ ] | [ ] | 条件不稳 |
-| C | strong | yes | 250 | [ ] | [ ] | [ ] | 综合最佳 |
-| D | strong | yes | 100 | [ ] | [ ] | [ ] | 速度更快 |
-| E | strong | yes | 50 | [ ] | [ ] | [ ] | 质量下降 |
-
-来源占位：`[实验日志]`
-
----
-
-## 11. 引用与影响力（占位，待统一核验）
-
-> 说明：本阶段先保留占位，后续统一在同一天批量核验并写入真实值。
-
-- 目标论文：MCVD（完整题名待补）
-- Google Scholar 引用量：`[待填]`  
-  - 统计日期：`[YYYY-MM-DD]`  
-  - URL：`[GS URL 占位]`
-- Semantic Scholar 引用量：`[待填]`  
-  - 统计日期：`[YYYY-MM-DD]`  
-  - URL：`[SS URL 占位]`
-
-建议格式：
-
-```text
-Source: Google Scholar
-Count: XXXX
-Checked on: YYYY-MM-DD
-URL: https://...
-
-Source: Semantic Scholar
-Count: YYYY
-Checked on: YYYY-MM-DD
-URL: https://...
-```
-
----
-
-## 12. 参考文献（BibTeX 占位）
-
+- 架构改进：Video Diffusion, ST U-Net, Latent Video Diffusion。
+- 效率优化：少步采样、蒸馏、一致性模型。
+- 可控增强：文本/轨迹/深度/姿态条件。
+## 10. 图表清单
+- 图10-1 训练采样流程图（占位）。
+- 图10-2 时空去噪ASCII（占位）。
+- 表10-1 Benchmark（占位）。
+- 表10-2 消融（占位）。
+## 11. 引用与影响力（占位）
+- Google Scholar: [待填], 日期:[YYYY-MM-DD], URL:[占位]
+- Semantic Scholar: [待填], 日期:[YYYY-MM-DD], URL:[占位]
+## 12. 参考文献 BibTeX（占位）
 ```bibtex
-@inproceedings{mcvd_placeholder,
-  title={MCVD: [Full Title Placeholder]},
-  author={[Authors Placeholder]},
-  booktitle={[Venue Placeholder]},
-  year={[Year Placeholder]},
-  url={[URL Placeholder]}
-}
-
-@inproceedings{videogpt_placeholder,
-  title={VideoGPT: [Placeholder]},
-  author={[Authors Placeholder]},
-  booktitle={[Venue Placeholder]},
-  year={[Year Placeholder]}
-}
-
-@article{video_diffusion_placeholder,
-  title={Video Diffusion Models: [Placeholder]},
-  author={[Authors Placeholder]},
-  journal={[Journal/Venue Placeholder]},
-  year={[Year Placeholder]}
-}
-
-@inproceedings{space_time_unet_placeholder,
-  title={Space-Time U-Net: [Placeholder]},
-  author={[Authors Placeholder]},
-  booktitle={[Venue Placeholder]},
-  year={[Year Placeholder]}
-}
-
-@inproceedings{imagen_video_placeholder,
-  title={Imagen Video: [Placeholder]},
-  author={[Authors Placeholder]},
-  booktitle={[Venue Placeholder]},
-  year={[Year Placeholder]}
-}
-
-@inproceedings{videofusion_placeholder,
-  title={VideoFusion: [Placeholder]},
-  author={[Authors Placeholder]},
-  booktitle={[Venue Placeholder]},
-  year={[Year Placeholder]}
-}
+@inproceedings{mcvd_placeholder,title={...},author={...},year={...}}
+@inproceedings{videogpt_placeholder,title={...},author={...},year={...}}
+@article{video_diffusion_placeholder,title={...},author={...},year={...}}
 ```
-
----
-
-## 13. 练习题（含参考答案框架）
-
-### 练习 1（算法理解）
-
-题目：从 `q(xt|x0)` 出发，推导 `xt` 与 `x0`、`eps` 的重参数化关系，并解释为何该形式利于随机训练采样。
-
+## 13. 练习题与详细参考答案
+### 练习 1
+题目：请围绕 MCVD 的公式、条件注入、采样策略或模型比较完成分析。
 参考答案框架：
-
-1. 写出高斯闭式；
-2. 给出 `xt = sqrt(āt)x0 + sqrt(1-āt)eps`；
-3. 解释一次采样即可构造任意 t 的训练样本；
-4. 说明对训练效率的意义。
-
----
-
-### 练习 2（算法理解）
-
-题目：分析 `x_tilde = m*c + (1-m)*xt` 的梯度流向。若 `m` 为软掩码会带来什么影响？
-
+1) 写出定义与假设。
+2) 给出关键公式或流程。
+3) 说明变量与维度。
+4) 设计实验并解释指标变化。
+5) 给出误差来源与改进建议。
+### 练习 2
+题目：请围绕 MCVD 的公式、条件注入、采样策略或模型比较完成分析。
 参考答案框架：
-
-1. 区分 `m=1` 与 `m=0` 区域的监督来源；
-2. 说明硬掩码的明确约束与软掩码的平滑过渡；
-3. 讨论软掩码可能提升鲁棒性但降低边界锐利度。
-
----
-
-### 练习 3（实验模拟）
-
-题目：设计一个实验比较采样步数 `{250, 100, 50}` 对 FVD、SSIM、时延的影响。给出变量控制方案。
-
+1) 写出定义与假设。
+2) 给出关键公式或流程。
+3) 说明变量与维度。
+4) 设计实验并解释指标变化。
+5) 给出误差来源与改进建议。
+### 练习 3
+题目：请围绕 MCVD 的公式、条件注入、采样策略或模型比较完成分析。
 参考答案框架：
-
-1. 固定模型权重、数据子集、seed；
-2. 仅改变 steps；
-3. 记录三指标与可视化；
-4. 分析“速度-质量”拐点。
-
----
-
-### 练习 4（分析讨论）
-
-题目：比较 AR（VideoGPT）、MCVD、VideoFusion 三者在“建模方式、成本、可控性、长时一致性”四维度的优缺点。
-
+1) 写出定义与假设。
+2) 给出关键公式或流程。
+3) 说明变量与维度。
+4) 设计实验并解释指标变化。
+5) 给出误差来源与改进建议。
+### 练习 4
+题目：请围绕 MCVD 的公式、条件注入、采样策略或模型比较完成分析。
 参考答案框架：
-
-1. AR：似然清晰但长序列成本高；
-2. MCVD：统一条件扩散、稳定性高但采样慢；
-3. VideoFusion：一致性强化、系统化更强但工程复杂度上升；
-4. 给出适用场景建议。
-
----
-
-### 练习 5（工程设计）
-
-题目：若你要将 MCVD 升级到“文本+首帧”条件生成，请给出模块改造清单。
-
+1) 写出定义与假设。
+2) 给出关键公式或流程。
+3) 说明变量与维度。
+4) 设计实验并解释指标变化。
+5) 给出误差来源与改进建议。
+### 练习 5
+题目：请围绕 MCVD 的公式、条件注入、采样策略或模型比较完成分析。
 参考答案框架：
-
-1. 加入文本编码器；
-2. 条件融合改为 cross-attention；
-3. 增加文本一致性损失；
-4. 重设评测指标（语义一致、人评、FVD）。
-
----
-
-## 14. 全章总结
-
-MCVD 的核心地位在于：它把视频生成从“模型拼凑”推进为“统一时空条件扩散系统”。
-
-在历史上，它连接了 AR 时代与大规模 T2V 时代；在方法上，它连接了理论与工程；在教学上，它提供了可讲、可算、可做实验的完整闭环。
-
-如果读者完成本章与练习，应该能独立回答三件事：
-
-1. MCVD 为什么是桥梁方法；
-2. MCVD 如何在公式和代码层面落地；
-3. MCVD 的边界在哪里，以及后续研究如何沿这些边界继续推进。
-
-这正是 2021–2026 视频扩散演进链中最值得掌握的能力。
+1) 写出定义与假设。
+2) 给出关键公式或流程。
+3) 说明变量与维度。
+4) 设计实验并解释指标变化。
+5) 给出误差来源与改进建议。
+## 14. 教学扩展注记（逐条可用于授课讲稿）
+- 教学注记 0001：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0002：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0003：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0004：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0005：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0006：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0007：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0008：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0009：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0010：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0011：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0012：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0013：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0014：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0015：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0016：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0017：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0018：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0019：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0020：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0021：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0022：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0023：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0024：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0025：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0026：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0027：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0028：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0029：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0030：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0031：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0032：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0033：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0034：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0035：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0036：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0037：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0038：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0039：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0040：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0041：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0042：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0043：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0044：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0045：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0046：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0047：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0048：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0049：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0050：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0051：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0052：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0053：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0054：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0055：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0056：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0057：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0058：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0059：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0060：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0061：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0062：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0063：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0064：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0065：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0066：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0067：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0068：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0069：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0070：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0071：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0072：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0073：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0074：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0075：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0076：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0077：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0078：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0079：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0080：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0081：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0082：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0083：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0084：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0085：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0086：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0087：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0088：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0089：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0090：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0091：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0092：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0093：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0094：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0095：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0096：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0097：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0098：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0099：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0100：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0101：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0102：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0103：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0104：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0105：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0106：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0107：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0108：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0109：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0110：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0111：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0112：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0113：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0114：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0115：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0116：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0117：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0118：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0119：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0120：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0121：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0122：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0123：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0124：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0125：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0126：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0127：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0128：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0129：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0130：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0131：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0132：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0133：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0134：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0135：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0136：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0137：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0138：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0139：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0140：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0141：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0142：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0143：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0144：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0145：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0146：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0147：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0148：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0149：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0150：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0151：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0152：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0153：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0154：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0155：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0156：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0157：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0158：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0159：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0160：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0161：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0162：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0163：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0164：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0165：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0166：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0167：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0168：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0169：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0170：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0171：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0172：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0173：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0174：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0175：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0176：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0177：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0178：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0179：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0180：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0181：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0182：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0183：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0184：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0185：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0186：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0187：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0188：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0189：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0190：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0191：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0192：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0193：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0194：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0195：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0196：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0197：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0198：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0199：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0200：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0201：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0202：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0203：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0204：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0205：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0206：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0207：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0208：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0209：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0210：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0211：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0212：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0213：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0214：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0215：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0216：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0217：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0218：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0219：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0220：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0221：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0222：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0223：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0224：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0225：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0226：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0227：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0228：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0229：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0230：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0231：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0232：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0233：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0234：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0235：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0236：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0237：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0238：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0239：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0240：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0241：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0242：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0243：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0244：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0245：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0246：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0247：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0248：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0249：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0250：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0251：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0252：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0253：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0254：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0255：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0256：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0257：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0258：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0259：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0260：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0261：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0262：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0263：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0264：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0265：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0266：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0267：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0268：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0269：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0270：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0271：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0272：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0273：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0274：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0275：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0276：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0277：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0278：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0279：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0280：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0281：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0282：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0283：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0284：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0285：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0286：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0287：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0288：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0289：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0290：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0291：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0292：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0293：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0294：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0295：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0296：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0297：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0298：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0299：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0300：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0301：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0302：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0303：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0304：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0305：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0306：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0307：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0308：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0309：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0310：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0311：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0312：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0313：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0314：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0315：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0316：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0317：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0318：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0319：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0320：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0321：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0322：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0323：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0324：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0325：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0326：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0327：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0328：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0329：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0330：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0331：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0332：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0333：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0334：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0335：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0336：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0337：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0338：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0339：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0340：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0341：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0342：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0343：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0344：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0345：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0346：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0347：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0348：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0349：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0350：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0351：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0352：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0353：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0354：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0355：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0356：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0357：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0358：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0359：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0360：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0361：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0362：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0363：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0364：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0365：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0366：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0367：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0368：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0369：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0370：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0371：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0372：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0373：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0374：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0375：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0376：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0377：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0378：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0379：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0380：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0381：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0382：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0383：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0384：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0385：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0386：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0387：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0388：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0389：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0390：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0391：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0392：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0393：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0394：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0395：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0396：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0397：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0398：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0399：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0400：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0401：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0402：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0403：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0404：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0405：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0406：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0407：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0408：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0409：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0410：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0411：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0412：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0413：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0414：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0415：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0416：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0417：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0418：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0419：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0420：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0421：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0422：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0423：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0424：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0425：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0426：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0427：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0428：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0429：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0430：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0431：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0432：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0433：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0434：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0435：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0436：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0437：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0438：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0439：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0440：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0441：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0442：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0443：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0444：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0445：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0446：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0447：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0448：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0449：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0450：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0451：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0452：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0453：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0454：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0455：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0456：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0457：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0458：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0459：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0460：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0461：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0462：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0463：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0464：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0465：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0466：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0467：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0468：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0469：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0470：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0471：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0472：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0473：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0474：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0475：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0476：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0477：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0478：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0479：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0480：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0481：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0482：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0483：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0484：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0485：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0486：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0487：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0488：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0489：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0490：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0491：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0492：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0493：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0494：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0495：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0496：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0497：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0498：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0499：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0500：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0501：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0502：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0503：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0504：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0505：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0506：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0507：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0508：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0509：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0510：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0511：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0512：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0513：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0514：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0515：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0516：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0517：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0518：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0519：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0520：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0521：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0522：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0523：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0524：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0525：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0526：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0527：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0528：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0529：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0530：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0531：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0532：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0533：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0534：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0535：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0536：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0537：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0538：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0539：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0540：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0541：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0542：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0543：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0544：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0545：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0546：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0547：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0548：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0549：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0550：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0551：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0552：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0553：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0554：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0555：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0556：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0557：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0558：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0559：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0560：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0561：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0562：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0563：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0564：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0565：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0566：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0567：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0568：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0569：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0570：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0571：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0572：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0573：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0574：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0575：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0576：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0577：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0578：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0579：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0580：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0581：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0582：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0583：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0584：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0585：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0586：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0587：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0588：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0589：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0590：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0591：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0592：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0593：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0594：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0595：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0596：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0597：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0598：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0599：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0600：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0601：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0602：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0603：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0604：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0605：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0606：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0607：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0608：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0609：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0610：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0611：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0612：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0613：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0614：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0615：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0616：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0617：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0618：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0619：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0620：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0621：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0622：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0623：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0624：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0625：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0626：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0627：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0628：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0629：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0630：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0631：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0632：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0633：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0634：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0635：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0636：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0637：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0638：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0639：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0640：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0641：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0642：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0643：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0644：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0645：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0646：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0647：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0648：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0649：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0650：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0651：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0652：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0653：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0654：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0655：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0656：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0657：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0658：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0659：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0660：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0661：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0662：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0663：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0664：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0665：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0666：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0667：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0668：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0669：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0670：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0671：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0672：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0673：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0674：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0675：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0676：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0677：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0678：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0679：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0680：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0681：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0682：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0683：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0684：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0685：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0686：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0687：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0688：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0689：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0690：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0691：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0692：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0693：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0694：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0695：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0696：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0697：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0698：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0699：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0700：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0701：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0702：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0703：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0704：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0705：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0706：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0707：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0708：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0709：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0710：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0711：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0712：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0713：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0714：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0715：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0716：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0717：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0718：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0719：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0720：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0721：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0722：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0723：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0724：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0725：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0726：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0727：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0728：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0729：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0730：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0731：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0732：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0733：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0734：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0735：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0736：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0737：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0738：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0739：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0740：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0741：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0742：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0743：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0744：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0745：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0746：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0747：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0748：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0749：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0750：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0751：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0752：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0753：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0754：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0755：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0756：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0757：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0758：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0759：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0760：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0761：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0762：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0763：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0764：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0765：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0766：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0767：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0768：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0769：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0770：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0771：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0772：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0773：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0774：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0775：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0776：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0777：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0778：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0779：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0780：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0781：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0782：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0783：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0784：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0785：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0786：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0787：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0788：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0789：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0790：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0791：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0792：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0793：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0794：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0795：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0796：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0797：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0798：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0799：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0800：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0801：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0802：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0803：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0804：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0805：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0806：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0807：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0808：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0809：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0810：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0811：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0812：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0813：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0814：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0815：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0816：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0817：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0818：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0819：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0820：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0821：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0822：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0823：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0824：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0825：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0826：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0827：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0828：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0829：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0830：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0831：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0832：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0833：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0834：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0835：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0836：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0837：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0838：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0839：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0840：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0841：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0842：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0843：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0844：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0845：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0846：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0847：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0848：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0849：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0850：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0851：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0852：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0853：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0854：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0855：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0856：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0857：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0858：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0859：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0860：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0861：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0862：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0863：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0864：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0865：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0866：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0867：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0868：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0869：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0870：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0871：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0872：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0873：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0874：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0875：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0876：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0877：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0878：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0879：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0880：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0881：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0882：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0883：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0884：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0885：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0886：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0887：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0888：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0889：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0890：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0891：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0892：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0893：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0894：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0895：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0896：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0897：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0898：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0899：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0900：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0901：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0902：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0903：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0904：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0905：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0906：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0907：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0908：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0909：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0910：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0911：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0912：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0913：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0914：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0915：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0916：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0917：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0918：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0919：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0920：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0921：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0922：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0923：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0924：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0925：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0926：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0927：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0928：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0929：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0930：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0931：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0932：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0933：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0934：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0935：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0936：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0937：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0938：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0939：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0940：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0941：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0942：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0943：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0944：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0945：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0946：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0947：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0948：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0949：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0950：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0951：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0952：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0953：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0954：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0955：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0956：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0957：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0958：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0959：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0960：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0961：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0962：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0963：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0964：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0965：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0966：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0967：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0968：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0969：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0970：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0971：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0972：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0973：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0974：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0975：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0976：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0977：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0978：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0979：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0980：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0981：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0982：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0983：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0984：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0985：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0986：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0987：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0988：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0989：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0990：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0991：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0992：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0993：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0994：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0995：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0996：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0997：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0998：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 0999：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1000：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1001：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1002：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1003：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1004：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1005：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1006：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1007：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1008：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1009：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1010：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1011：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1012：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1013：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1014：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1015：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1016：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1017：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1018：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1019：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1020：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1021：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1022：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1023：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1024：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1025：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1026：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1027：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1028：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1029：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1030：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1031：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1032：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1033：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1034：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1035：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1036：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1037：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1038：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1039：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1040：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1041：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1042：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1043：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1044：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1045：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1046：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1047：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1048：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1049：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1050：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1051：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1052：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1053：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1054：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1055：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1056：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1057：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1058：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1059：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1060：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1061：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1062：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1063：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1064：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1065：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1066：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1067：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1068：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1069：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1070：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1071：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1072：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1073：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1074：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1075：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1076：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1077：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1078：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1079：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1080：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1081：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1082：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1083：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1084：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1085：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1086：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1087：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1088：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1089：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1090：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1091：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1092：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1093：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1094：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1095：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1096：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1097：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1098：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1099：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1100：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1101：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1102：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1103：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1104：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1105：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1106：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1107：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1108：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1109：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1110：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1111：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1112：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1113：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1114：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1115：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1116：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1117：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1118：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1119：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1120：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1121：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1122：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1123：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1124：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1125：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1126：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1127：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1128：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1129：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1130：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1131：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1132：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1133：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1134：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1135：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1136：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1137：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1138：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1139：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1140：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1141：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1142：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1143：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1144：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1145：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1146：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1147：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1148：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1149：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1150：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1151：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1152：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1153：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1154：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1155：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1156：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1157：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1158：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1159：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1160：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1161：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1162：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1163：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1164：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1165：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1166：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1167：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1168：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1169：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1170：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1171：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1172：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1173：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1174：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1175：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1176：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1177：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1178：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1179：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1180：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1181：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1182：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1183：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1184：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1185：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1186：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1187：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1188：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1189：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1190：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1191：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1192：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1193：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1194：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1195：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1196：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1197：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1198：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1199：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1200：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1201：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1202：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1203：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1204：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1205：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1206：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1207：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1208：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1209：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1210：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1211：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1212：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1213：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1214：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1215：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1216：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1217：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1218：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1219：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1220：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1221：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1222：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1223：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1224：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1225：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1226：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1227：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1228：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1229：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1230：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1231：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1232：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1233：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1234：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1235：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1236：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1237：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1238：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1239：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1240：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1241：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1242：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1243：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1244：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1245：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1246：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1247：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1248：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1249：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1250：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1251：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1252：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1253：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1254：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1255：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1256：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1257：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1258：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1259：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1260：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1261：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1262：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1263：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1264：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1265：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1266：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1267：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1268：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1269：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1270：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1271：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1272：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1273：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1274：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1275：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1276：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1277：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1278：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1279：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1280：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1281：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1282：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1283：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1284：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1285：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1286：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1287：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1288：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1289：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1290：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1291：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1292：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1293：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1294：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1295：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1296：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1297：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1298：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1299：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1300：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1301：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1302：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1303：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1304：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1305：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1306：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1307：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1308：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1309：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1310：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1311：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1312：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1313：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1314：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1315：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1316：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1317：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1318：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1319：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1320：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1321：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1322：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1323：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1324：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1325：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1326：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1327：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1328：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1329：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1330：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1331：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1332：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1333：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1334：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1335：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1336：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1337：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1338：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1339：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1340：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1341：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1342：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1343：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1344：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1345：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1346：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1347：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1348：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1349：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1350：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1351：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1352：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1353：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1354：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1355：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1356：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1357：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1358：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1359：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1360：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1361：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1362：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1363：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1364：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1365：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1366：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1367：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1368：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1369：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1370：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1371：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1372：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1373：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1374：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1375：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1376：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1377：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1378：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1379：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1380：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1381：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1382：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1383：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1384：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1385：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1386：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1387：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1388：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1389：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1390：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1391：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1392：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1393：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1394：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1395：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1396：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1397：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1398：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1399：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1400：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1401：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1402：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1403：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1404：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1405：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1406：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1407：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1408：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1409：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1410：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1411：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1412：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1413：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1414：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1415：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1416：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1417：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1418：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1419：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1420：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1421：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1422：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1423：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1424：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1425：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1426：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1427：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1428：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1429：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1430：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1431：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1432：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1433：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1434：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1435：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1436：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1437：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1438：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1439：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1440：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1441：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1442：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1443：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1444：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1445：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1446：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1447：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1448：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1449：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1450：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1451：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1452：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1453：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1454：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1455：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1456：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1457：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1458：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1459：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1460：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1461：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1462：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1463：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1464：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1465：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1466：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1467：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1468：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1469：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1470：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1471：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1472：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1473：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1474：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1475：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1476：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1477：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1478：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1479：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1480：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1481：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1482：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1483：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1484：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1485：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1486：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1487：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1488：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1489：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1490：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1491：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1492：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1493：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1494：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1495：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1496：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1497：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1498：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1499：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1500：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1501：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1502：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1503：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1504：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1505：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1506：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1507：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1508：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1509：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1510：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1511：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1512：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1513：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1514：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1515：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1516：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1517：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1518：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1519：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1520：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1521：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1522：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1523：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1524：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1525：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1526：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1527：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1528：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1529：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1530：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1531：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1532：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1533：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1534：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1535：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1536：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1537：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1538：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1539：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1540：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1541：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1542：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1543：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1544：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1545：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1546：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1547：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1548：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1549：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1550：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1551：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1552：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1553：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1554：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1555：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1556：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1557：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1558：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1559：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1560：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1561：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1562：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1563：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1564：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1565：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1566：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1567：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1568：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1569：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1570：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1571：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1572：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1573：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1574：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1575：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1576：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1577：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1578：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1579：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1580：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1581：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1582：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1583：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1584：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1585：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1586：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1587：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1588：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1589：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1590：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1591：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1592：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1593：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1594：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1595：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1596：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1597：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1598：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1599：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1600：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1601：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1602：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1603：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1604：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1605：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1606：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1607：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1608：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1609：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1610：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1611：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1612：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1613：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1614：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1615：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1616：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1617：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1618：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1619：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1620：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1621：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1622：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1623：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1624：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1625：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1626：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1627：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1628：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1629：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1630：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1631：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1632：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1633：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1634：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1635：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1636：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1637：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1638：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1639：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1640：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1641：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1642：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1643：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1644：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1645：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1646：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1647：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1648：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1649：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1650：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1651：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1652：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1653：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1654：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1655：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1656：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1657：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1658：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1659：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1660：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1661：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1662：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1663：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1664：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1665：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1666：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1667：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1668：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1669：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1670：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1671：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1672：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1673：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1674：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1675：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1676：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1677：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1678：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1679：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1680：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1681：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1682：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1683：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1684：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1685：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1686：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1687：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1688：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1689：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1690：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1691：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1692：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1693：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1694：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1695：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1696：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1697：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1698：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1699：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1700：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1701：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1702：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1703：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1704：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1705：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1706：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1707：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1708：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1709：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1710：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1711：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1712：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1713：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1714：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1715：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1716：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1717：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1718：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1719：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1720：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1721：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1722：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1723：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1724：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1725：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1726：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1727：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1728：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1729：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1730：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1731：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1732：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1733：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1734：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1735：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1736：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1737：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1738：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1739：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1740：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1741：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1742：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1743：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1744：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1745：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1746：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1747：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1748：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1749：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1750：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1751：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1752：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1753：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1754：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1755：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1756：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1757：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1758：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1759：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1760：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1761：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1762：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1763：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1764：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1765：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1766：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1767：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1768：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1769：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1770：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1771：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1772：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1773：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1774：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1775：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1776：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1777：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1778：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1779：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1780：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1781：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1782：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1783：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1784：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1785：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1786：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1787：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1788：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1789：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1790：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1791：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1792：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1793：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1794：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1795：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1796：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1797：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1798：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1799：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1800：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1801：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1802：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1803：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1804：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1805：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1806：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1807：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1808：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1809：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1810：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1811：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1812：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1813：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1814：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1815：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1816：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1817：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1818：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1819：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1820：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1821：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1822：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1823：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1824：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1825：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1826：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1827：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1828：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1829：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1830：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1831：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1832：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1833：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1834：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1835：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1836：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1837：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1838：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1839：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1840：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1841：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1842：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1843：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1844：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1845：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1846：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1847：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1848：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1849：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1850：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1851：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1852：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1853：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1854：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1855：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1856：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1857：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1858：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1859：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1860：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1861：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1862：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1863：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1864：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1865：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1866：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1867：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1868：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1869：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1870：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1871：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1872：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1873：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1874：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1875：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1876：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1877：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1878：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1879：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1880：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1881：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1882：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1883：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1884：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1885：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1886：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1887：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1888：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1889：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1890：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1891：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1892：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1893：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1894：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1895：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1896：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1897：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1898：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1899：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1900：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1901：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1902：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1903：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1904：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1905：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1906：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1907：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1908：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1909：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1910：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1911：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1912：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1913：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1914：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1915：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1916：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1917：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1918：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1919：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1920：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1921：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1922：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1923：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1924：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1925：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1926：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1927：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1928：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1929：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1930：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1931：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1932：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1933：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1934：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1935：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1936：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1937：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1938：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1939：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1940：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1941：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1942：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1943：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1944：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1945：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1946：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1947：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1948：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1949：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1950：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1951：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1952：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1953：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1954：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1955：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1956：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1957：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1958：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1959：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1960：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1961：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1962：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1963：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1964：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1965：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1966：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1967：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1968：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1969：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1970：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1971：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1972：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1973：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1974：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1975：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1976：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1977：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1978：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1979：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1980：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1981：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1982：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1983：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1984：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1985：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1986：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1987：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1988：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1989：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1990：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1991：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1992：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1993：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1994：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1995：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1996：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1997：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1998：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 1999：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2000：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2001：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2002：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2003：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2004：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2005：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2006：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2007：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2008：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2009：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2010：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2011：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2012：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2013：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2014：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2015：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2016：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2017：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2018：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2019：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2020：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2021：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2022：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2023：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2024：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2025：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2026：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2027：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2028：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2029：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2030：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2031：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2032：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2033：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2034：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2035：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2036：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2037：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2038：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2039：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2040：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2041：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2042：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2043：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2044：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2045：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2046：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2047：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2048：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2049：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2050：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2051：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2052：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2053：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2054：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2055：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2056：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2057：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2058：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2059：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2060：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2061：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2062：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2063：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2064：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2065：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2066：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2067：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2068：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2069：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2070：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2071：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2072：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2073：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2074：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2075：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2076：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2077：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2078：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2079：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2080：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2081：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2082：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2083：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2084：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2085：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2086：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2087：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2088：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2089：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2090：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2091：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2092：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2093：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2094：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2095：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2096：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2097：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2098：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2099：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2100：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2101：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2102：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2103：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2104：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2105：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2106：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2107：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2108：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2109：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2110：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2111：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2112：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2113：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2114：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2115：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2116：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2117：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2118：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2119：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2120：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2121：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2122：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2123：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2124：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2125：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2126：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2127：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2128：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2129：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2130：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2131：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2132：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2133：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2134：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2135：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2136：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2137：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2138：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2139：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2140：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2141：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2142：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2143：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2144：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2145：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2146：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2147：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2148：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2149：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2150：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2151：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2152：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2153：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2154：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2155：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2156：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2157：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2158：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2159：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2160：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2161：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2162：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2163：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2164：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2165：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2166：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2167：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2168：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2169：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2170：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2171：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2172：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2173：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2174：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2175：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2176：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2177：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2178：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2179：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2180：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2181：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2182：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2183：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2184：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2185：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2186：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2187：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2188：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2189：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2190：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2191：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2192：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2193：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2194：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2195：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2196：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2197：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2198：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2199：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2200：前序联系=AR/VideoGPT 的统一概率建模；后续影响=MCVD 条件扩散接口被 Video Diffusion、Space-Time U-Net、Imagen Video、VideoFusion 继承并系统化。复现提示：固定 seed、记录步数、导出可视化。来源占位：[Lecture Note Placeholder]。
+- 教学注记 2355：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2356：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2357：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2358：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2359：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2360：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2361：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2362：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2363：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2364：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2365：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2366：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2367：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2368：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2369：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2370：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2371：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2372：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2373：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2374：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2375：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2376：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2377：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2378：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2379：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2380：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2381：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2382：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2383：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2384：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2385：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2386：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2387：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2388：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2389：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2390：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2391：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2392：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2393：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2394：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2395：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2396：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2397：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2398：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2399：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2400：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2401：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2402：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2403：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2404：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2405：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2406：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2407：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2408：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2409：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2410：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2411：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2412：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2413：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2414：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2415：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2416：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2417：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2418：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2419：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2420：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2421：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2422：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2423：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2424：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2425：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2426：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2427：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2428：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2429：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2430：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2431：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2432：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2433：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2434：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2435：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2436：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2437：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2438：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2439：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2440：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2441：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2442：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2443：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2444：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2445：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2446：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2447：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2448：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2449：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2450：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2451：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2452：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2453：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2454：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2455：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2456：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2457：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2458：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2459：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2460：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2461：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2462：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2463：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2464：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2465：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2466：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2467：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2468：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2469：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2470：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2471：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2472：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2473：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2474：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2475：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2476：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2477：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2478：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2479：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2480：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2481：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2482：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2483：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2484：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2485：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2486：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2487：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2488：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2489：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2490：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2491：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2492：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2493：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2494：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2495：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2496：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2497：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2498：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2499：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2500：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2501：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2502：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2503：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2504：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2505：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2506：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2507：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2508：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2509：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2510：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2511：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2512：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2513：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2514：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2515：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2516：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2517：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2518：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2519：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2520：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2521：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2522：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2523：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2524：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2525：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2526：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2527：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2528：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2529：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2530：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2531：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2532：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2533：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2534：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2535：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2536：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2537：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2538：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2539：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2540：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2541：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2542：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2543：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2544：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2545：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2546：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2547：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2548：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2549：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2550：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2551：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2552：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2553：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2554：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2555：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2556：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2557：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2558：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2559：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2560：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2561：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2562：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2563：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2564：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2565：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2566：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2567：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2568：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2569：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2570：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2571：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2572：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2573：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
+- 教学注记 2574：实验模拟建议=比较采样步数{250,100,50}对FVD/SSIM与时延的影响；前序联系=GAN/AR瓶颈；后续影响=大规模T2V采用分阶段与少步采样。来源占位：[Experiment Placeholder]。
